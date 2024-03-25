@@ -1,5 +1,6 @@
 use std::net::{TcpListener, SocketAddr, TcpStream};
 use std::thread::spawn;
+use std::io;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
@@ -7,6 +8,7 @@ struct ProxyServer {
     target_addr: SocketAddr
 }
 
+#[derive(Debug)]
 struct Packet {
     packet_length: u32,
     packet_id: u8,
@@ -23,47 +25,43 @@ impl Packet {
     }
 }
 
-fn receive_packet(stream: &mut TcpStream) -> Packet {
+fn receive_packet(stream: &mut TcpStream) -> io::Result<Packet> {
     let mut packet_size_buffer = [0u8; 4];
-    stream.read_exact(&mut packet_size_buffer).unwrap();
+    if let Err(error) = stream.read_exact(&mut packet_size_buffer) {
+        stream.shutdown(std::net::Shutdown::Both)?;
+        return Err(error);
+    };
     let packet_length = u32::from_le_bytes(packet_size_buffer);
 
     let mut left_to_read = packet_length;
 
     let mut packet_id_buffer = [0u8; 1];
-    stream.read_exact(&mut packet_id_buffer).unwrap();
+    stream.read_exact(&mut packet_id_buffer)?;
     let packet_id = packet_id_buffer[0];
     
     left_to_read -= 1;
 
     let mut packet_data_buffer = vec![0u8; left_to_read as usize];
-    stream.read_exact(&mut packet_data_buffer).unwrap();
+    stream.read_exact(&mut packet_data_buffer)?;
 
-    Packet {
+    Ok(Packet {
         packet_length: packet_length,
         packet_id: packet_id,
         packet_data_bytes: packet_data_buffer
-    }
+    })
 }
 
-fn pipe(incoming: &mut TcpStream, outgoing: &mut TcpStream, proxy: &mut Arc<Mutex<ProxyServer>>) {
+fn pipe(incoming: &mut TcpStream, outgoing: &mut TcpStream, _proxy: &mut Arc<Mutex<ProxyServer>>) -> io::Result<()> {
     loop {
-        let packet = receive_packet(incoming);
+        let packet = receive_packet(incoming)?;
 
-        if (&incoming.local_addr().unwrap()).to_string() == "127.0.0.1:6410" {
+        if (&incoming.local_addr()?).to_string() == "127.0.0.1:6410" {
             println!("[CLIENT>PROXY] packet received with id {}", packet.packet_id);
         } else {
             println!("[SERVER>PROXY] packet received with id {}", packet.packet_id);
         }
-        println!(
-            "{}", packet.to_bytes()
-                        .iter()
-                        .map(|b| format!("{:02X}", b).to_string())
-                        .collect::<Vec<String>>()
-                        .join(" ")
-        );
 
-        outgoing.write(&packet.to_bytes()).unwrap();
+        outgoing.write(&packet.to_bytes())?;
         outgoing.flush().unwrap();
     }
 }
@@ -71,6 +69,7 @@ fn pipe(incoming: &mut TcpStream, outgoing: &mut TcpStream, proxy: &mut Arc<Mute
 fn proxy_connection(mut incoming: TcpStream, proxy: &Arc<Mutex<ProxyServer>>) {
     println!("Client connected from: {:?}", incoming.peer_addr().unwrap());
 
+    println!("Connecting to {:?}", proxy.lock().unwrap().target_addr);
     let mut outgoing = TcpStream::connect(proxy.lock().unwrap().target_addr).unwrap();
 
     let mut incoming_clone = incoming.try_clone().unwrap();
@@ -84,8 +83,8 @@ fn proxy_connection(mut incoming: TcpStream, proxy: &Arc<Mutex<ProxyServer>>) {
 
     println!("Proxying data...");
 
-    forward.join().unwrap();
-    backward.join().unwrap();
+    let _ = forward.join().unwrap();
+    let _ = backward.join().unwrap();
 
     println!("Socket closed");
 }
@@ -100,7 +99,10 @@ fn main() {
     for socket in listener.incoming() {
         let socket = socket.unwrap();
 
+        println!("New proxy connection");
         let proxy_server_clone = proxy_server.clone();
         spawn(move || proxy_connection(socket, &proxy_server_clone));
     }
+
+    println!("{}", proxy_server.lock().unwrap().target_addr);
 }
